@@ -1,5 +1,6 @@
 """Backend for OpenRouter API"""
 
+import json
 import logging
 import os
 import time
@@ -11,6 +12,7 @@ from aide.backend.utils import (
     FunctionSpec,
     OutputType,
     backoff_create,
+    opt_messages_to_list,
 )
 
 logger = logging.getLogger("aide")
@@ -45,17 +47,14 @@ def query(
     _setup_openrouter_client()
     filtered_kwargs: dict = select_values(notnone, model_kwargs)  # type: ignore
 
-    if func_spec is not None:
-        raise NotImplementedError(
-            "We are not supporting function calling in OpenRouter for now."
-        )
+    messages = opt_messages_to_list(
+        system_message, user_message, convert_system_to_user=convert_system_to_user
+    )
 
-    # in case some backends dont support system roles, just convert everything to user
-    messages = [
-        {"role": "user", "content": message}
-        for message in [system_message, user_message]
-        if message
-    ]
+    if func_spec is not None:
+        # Align with OpenAI backend: add tools and force selection
+        filtered_kwargs["tools"] = [func_spec.as_openai_tool_dict]
+        filtered_kwargs["tool_choice"] = func_spec.openai_tool_choice_dict
 
     t0 = time.time()
     completion = backoff_create(
@@ -63,6 +62,7 @@ def query(
         OPENAI_TIMEOUT_EXCEPTIONS,
         messages=messages,
         extra_body={
+            # Hint the provider ordering; safe to include with or without tools
             "provider": {
                 "order": ["Fireworks"],
                 "ignore": ["Together", "DeepInfra", "Hyperbolic"],
@@ -72,7 +72,24 @@ def query(
     )
     req_time = time.time() - t0
 
-    output = completion.choices[0].message.content
+    choice = completion.choices[0]
+
+    if func_spec is None:
+        output: OutputType = choice.message.content
+    else:
+        assert (
+            choice.message.tool_calls
+        ), f"function_call is empty, it is not a function call: {choice.message}"
+        assert (
+            choice.message.tool_calls[0].function.name == func_spec.name
+        ), "Function name mismatch"
+        try:
+            output = json.loads(choice.message.tool_calls[0].function.arguments)
+        except json.JSONDecodeError as e:
+            logger.error(
+                f"Error decoding the function arguments: {choice.message.tool_calls[0].function.arguments}"
+            )
+            raise e
 
     in_tokens = completion.usage.prompt_tokens
     out_tokens = completion.usage.completion_tokens
