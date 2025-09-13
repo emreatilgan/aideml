@@ -36,6 +36,29 @@ def _setup_openrouter_client():
         max_retries=0,
     )
 
+def _append_json_mode_instruction(messages: list[dict[str, str]], func_spec: FunctionSpec) -> list[dict[str, str]]:
+    instr = (
+        f"You must produce ONLY a single JSON object for function '{func_spec.name}' "
+        f"that matches this JSON Schema exactly (no extra keys, no prose, no markdown):\n"
+        f"{json.dumps(func_spec.json_schema)}"
+    )
+    # Append as a user message to be most universally honored
+    return messages + [{"role": "user", "content": instr}]
+
+def _extract_json(s: str) -> dict:
+    # direct parse
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    # try to grab the largest {...} block
+    start = s.find("{")
+    end = s.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        snippet = s[start : end + 1]
+        return json.loads(snippet)
+    # last resort: raise
+    raise json.JSONDecodeError("Could not parse JSON from model output", s, 0)
 
 def query(
     system_message: str | None,
@@ -51,25 +74,47 @@ def query(
         system_message, user_message, convert_system_to_user=convert_system_to_user
     )
 
-    if func_spec is not None:
-        # Align with OpenAI backend: add tools and force selection
+    use_tools = func_spec is not None
+    if use_tools:
         filtered_kwargs["tools"] = [func_spec.as_openai_tool_dict]
         filtered_kwargs["tool_choice"] = func_spec.openai_tool_choice_dict
 
-    t0 = time.time()
-    completion = backoff_create(
-        _client.chat.completions.create,
-        OPENAI_TIMEOUT_EXCEPTIONS,
-        messages=messages,
-        extra_body={
-            # Hint the provider ordering; safe to include with or without tools
-            "provider": {
-                "order": ["Fireworks"],
-                "ignore": ["Together", "DeepInfra", "Hyperbolic"],
+    def do_request(msgs: list[dict[str, str]], kwargs: dict):
+        return backoff_create(
+            _client.chat.completions.create,
+            OPENAI_TIMEOUT_EXCEPTIONS,
+            messages=msgs,
+            extra_body={
+                "provider": {
+                    "order": ["Fireworks"],
+                    "ignore": ["Together", "DeepInfra", "Hyperbolic"],
+                },
             },
-        },
-        **filtered_kwargs,
-    )
+            **kwargs,
+        )
+
+    t0 = time.time()
+    completion = None
+
+    try:
+        completion = do_request(messages, filtered_kwargs)
+    except (openai.NotFoundError, openai.BadRequestError) as e:
+        # Likely: tools not supported by selected provider/model
+        logger.info(f"Tools likely unsupported by provider/model; falling back to JSON mode: {e}")
+        use_tools = False
+
+    # If the first attempt didn't succeed or tools are disabled after catching, try JSON-mode fallback
+    if completion is None and func_spec is not None and not use_tools:
+        json_messages = _append_json_mode_instruction(messages, func_spec)
+        # Remove tool kwargs if present
+        filtered_no_tools = {k: v for k, v in filtered_kwargs.items() if k not in ("tools", "tool_choice")}
+        completion = do_request(json_messages, filtered_no_tools)
+
+    # If completion is still None, bubble up whatever error occurred in do_request
+    if completion is None:
+        # backoff_create returns False on retryable exceptions; treat as error here to surface clearly
+        raise RuntimeError("OpenRouter request failed (completion is None/False)")
+
     req_time = time.time() - t0
 
     choice = completion.choices[0]
@@ -77,19 +122,21 @@ def query(
     if func_spec is None:
         output: OutputType = choice.message.content
     else:
-        assert (
-            choice.message.tool_calls
-        ), f"function_call is empty, it is not a function call: {choice.message}"
-        assert (
-            choice.message.tool_calls[0].function.name == func_spec.name
-        ), "Function name mismatch"
-        try:
-            output = json.loads(choice.message.tool_calls[0].function.arguments)
-        except json.JSONDecodeError as e:
-            logger.error(
-                f"Error decoding the function arguments: {choice.message.tool_calls[0].function.arguments}"
-            )
-            raise e
+        # If tools worked, parse tool call; otherwise parse JSON content
+        if getattr(choice.message, "tool_calls", None):
+            try:
+                assert choice.message.tool_calls[0].function.name == func_spec.name
+                output = json.loads(choice.message.tool_calls[0].function.arguments)
+            except json.JSONDecodeError as e:
+                logger.error(f"Error decoding tool function arguments: {choice.message.tool_calls[0].function.arguments}")
+                raise e
+        else:
+            # JSON-mode fallback (no tools)
+            try:
+                output = _extract_json(choice.message.content or "")
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse JSON in fallback mode: {choice.message.content}")
+                raise e
 
     in_tokens = completion.usage.prompt_tokens
     out_tokens = completion.usage.completion_tokens
