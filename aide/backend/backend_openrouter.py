@@ -86,8 +86,7 @@ def query(
             messages=msgs,
             extra_body={
                 "provider": {
-                    "order": ["Fireworks"],
-                    "ignore": ["Together", "DeepInfra", "Hyperbolic"],
+                    "sort": "price",
                 },
             },
             **kwargs,
@@ -117,6 +116,9 @@ def query(
 
     req_time = time.time() - t0
 
+    if not getattr(completion, "choices", None):
+        # include provider metadata for debugging
+        raise RuntimeError(f"OpenRouter returned no choices: {completion}")
     choice = completion.choices[0]
 
     if func_spec is None:

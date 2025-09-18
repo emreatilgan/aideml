@@ -144,6 +144,22 @@ def run():
         cfg.workspace_dir, **OmegaConf.to_container(cfg.exec)  # type: ignore
     )
 
+    # Persist best artifacts on termination/timeout
+    import signal
+    def persist_best_and_exit(signum=None, frame=None):
+        try:
+            save_run(cfg, journal)
+        finally:
+            try:
+                interpreter.cleanup_session()
+            except Exception:
+                pass
+        # If invoked by a timeout signal, prefer 124
+        sys.exit(124 if signum in (signal.SIGTERM, signal.SIGINT) else 0)
+
+    signal.signal(signal.SIGTERM, persist_best_and_exit)
+    signal.signal(signal.SIGINT, persist_best_and_exit)
+
     global_step = len(journal)
     prog = Progress(
         TextColumn("[progress.description]{task.description}"),
