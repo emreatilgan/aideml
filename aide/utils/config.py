@@ -21,6 +21,14 @@ from . import copytree, preproc_data, serialize
 shutup.mute_warnings()
 logger = logging.getLogger("aide")
 
+# Tree plot display configuration defaults
+TREE_PLOT = {
+    "show_metric": True,
+    "metric_key": "metric",
+    "metric_format": "{name}: {value:.4f}",
+    "render_in_label": True,
+    "render_in_tooltip": True,
+}
 
 """ these dataclasses are just for type hinting, the actual config is in config.yaml """
 
