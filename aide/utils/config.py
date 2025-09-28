@@ -15,12 +15,19 @@ import logging
 
 from aide.journal import Journal, filter_journal
 
-from . import tree_export
 from . import copytree, preproc_data, serialize
 
 shutup.mute_warnings()
 logger = logging.getLogger("aide")
 
+# Tree plot display configuration defaults
+TREE_PLOT = {
+    "show_metric": True,
+    "metric_key": "metric",
+    "metric_format": "{name}: {value:.4f}",
+    "render_in_label": True,
+    "render_in_tooltip": True,
+}
 
 """ these dataclasses are just for type hinting, the actual config is in config.yaml """
 
@@ -196,6 +203,8 @@ def save_run(cfg: Config, journal: Journal):
     # create the tree + code visualization
     # only if the journal has nodes
     if len(journal) > 0:
+        # Lazy import to avoid circular dependency with tree_export importing TREE_PLOT from this module
+        from . import tree_export
         tree_export.generate(cfg, journal, cfg.log_dir / "tree_plot.html")
     # save the best found solution
     best_node = journal.get_best_node()

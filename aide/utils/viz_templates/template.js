@@ -42,7 +42,18 @@ let manualSelection = false;
 
 let currentElemInd = 0;
 
-let treeStructData = <placeholder>
+let treeStructData = {};
+/*__TREE_DATA__*/ // injected at export time: treeStructData = {...};
+
+// runtime plot config (falls back to defaults if not provided by Python)
+const plotCfg = (treeStructData && treeStructData.tree_plot_cfg) || {
+  show_metric: true,
+  metric_key: "metric",
+  metric_format: "{name}: {value:.4f}",
+  render_in_label: true,
+  render_in_tooltip: true,
+};
+
 
 let lastClick = 0;
 let firstFrameTime = undefined;
@@ -77,6 +88,7 @@ class Node {
   renderSize = 10;
   edges = [];
   bgCol;
+  metricText = "";
 
   constructor(x, y, relSize, treeInd) {
     const minSize = 35;
@@ -124,6 +136,16 @@ class Node {
       dist(mouseXlocalCoords, mouseYlocalCoords, this.x, this.y) <
       this.renderSize / 1.5;
     if (isMouseOver) cursor(HAND);
+    if (isMouseOver && plotCfg.show_metric && plotCfg.render_in_tooltip) {
+      const mt =
+        this.metricText ||
+        (treeStructData.node_metric_text &&
+          treeStructData.node_metric_text[this.treeInd]) ||
+        "";
+      if (mt && typeof canvas !== "undefined" && canvas?.elt) {
+        canvas.elt.title = mt;
+      }
+    }
     if (isMouseOver && mouseIsPressed) {
       nodes.forEach((n) => (n.selected = false));
       this.selected = true;
@@ -170,6 +192,21 @@ class Node {
     fill(255);
     // fill(lerpColor(color(accentCol), color(255), this.animationProgress))
     text("{ }", this.x, this.y - 1);
+    if (plotCfg.show_metric && plotCfg.render_in_label) {
+      const mt =
+        this.metricText ||
+        (treeStructData.node_metric_text &&
+          treeStructData.node_metric_text[this.treeInd]) ||
+        "";
+      if (mt) {
+        push();
+        textAlign(CENTER, CENTER);
+        textSize(this.renderSize / 5);
+        fill(255);
+        text(mt, this.x, this.y + this.renderSize * 0.22);
+        pop();
+      }
+    }
     // DEBUG PRINT:
     // text(round(this.relSize, 2), this.x, this.y - 1)
     // text(this.treeInd, this.x, this.y + 15)
@@ -293,6 +330,9 @@ class Edge {
 
 draw = () => {
   cursor(ARROW);
+  if (typeof canvas !== "undefined" && canvas?.elt) {
+    canvas.elt.title = "";
+  }
   frameRate(120);
   if (!firstFrameTime && frameCount <= 1) {
     firstFrameTime = millis();
@@ -328,6 +368,12 @@ draw = () => {
       treeStructData.code[0],
       treeStructData.plan[0],
     )
+    // attach metric text per node for quick access
+    if (Array.isArray(treeStructData.node_metric_text)) {
+      nodes.forEach((n) => {
+        n.metricText = treeStructData.node_metric_text[n.treeInd] || "";
+      });
+    }
   }
 
   const staticNodes = nodes.filter(
