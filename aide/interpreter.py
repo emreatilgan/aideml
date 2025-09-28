@@ -118,6 +118,17 @@ class Interpreter:
         # a .py file should be able to import modules from the cwd anyway
         sys.path.append(str(self.working_dir))
 
+        # Expose EDA artifacts to executed code (if available)
+        try:
+            p_json = self.working_dir / "EDA_SUMMARY.json"
+            p_compact = self.working_dir / "EDA_COMPACT.md"
+            if p_json.exists():
+                os.environ["AIDE_EDA_JSON"] = str(p_json)
+            if p_compact.exists():
+                os.environ["AIDE_EDA_COMPACT"] = str(p_compact)
+        except Exception:
+            pass
+
         # capture stdout and stderr
         # trunk-ignore(mypy/assignment)
         sys.stdout = sys.stderr = RedirectQueue(result_outq)

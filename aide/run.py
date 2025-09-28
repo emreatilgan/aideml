@@ -25,6 +25,8 @@ from rich.markdown import Markdown
 from rich.status import Status
 from rich.tree import Tree
 from .utils.config import load_task_desc, prep_agent_workspace, save_run, load_cfg
+# EDA integration
+from .utils import eda as eda_mod
 
 
 class VerboseFilter(logging.Filter):
@@ -126,6 +128,15 @@ def run():
 
     with Status("Preparing agent workspace (copying and extracting files) ..."):
         prep_agent_workspace(cfg)
+
+    # Optional: run deterministic EDA and write artifacts/symlinks
+    if hasattr(cfg, "eda") and getattr(cfg.eda, "enable", False):
+        with Status("Running EDA ..."):
+            try:
+                eda_mod.generate_and_cache(cfg)
+            except Exception as e:
+                logger = logging.getLogger("aide")
+                logger.warning(f"EDA generation failed: {e}", extra={"verbose": True})
 
     def cleanup():
         if global_step == 0:

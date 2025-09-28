@@ -181,3 +181,34 @@ By repeatedly applying these steps, AIDE navigates the vast space of possible so
 | Biotech                          | Predict obesity risk                                                    | 62%   | [link](sample_results/playground-series-s4e2.py)                        | [link](https://www.kaggle.com/competitions/playground-series-s4e2/overview)                        |
 | Biotech                          | Classify presence of feature in data                                    | 66%   | [link](sample_results/cat-in-the-dat.py)                                | [link](https://www.kaggle.com/competitions/cat-in-the-dat/overview)                                |
 | Biotech                          | Predict patient's smoking status                                        | 40%   | [link](sample_results/playground-series-s3e24.py)                       | [link](https://www.kaggle.com/competitions/playground-series-s3e24/overview)                       |
+
+
+## EDA-driven context for better code generation
+
+AIDE can optionally run a deterministic EDA pass that produces:
+- A canonical JSON summary (machine-readable, cacheable)
+- A compact Markdown summary designed for prompt injection (token-efficient)
+
+Artifacts are written under the current experiment workspace. The agent will prefer the compact Markdown summary as its “Data Overview,” falling back to the legacy directory preview if disabled.
+
+How to enable:
+- CLI:
+  - Enable EDA and compact summary
+    - aide data_dir="example_tasks/house_prices" goal="Predict the sales price for each house" eda.enable=true eda.compact.enable=true eda.compact.mode=compact
+  - Use ultra-compact mode (tighter budget)
+    - aide data_dir="example_tasks/house_prices" goal="Predict the sales price for each house" eda.enable=true eda.compact.enable=true eda.compact.mode=ultra
+  - Adjust sampling/limits as needed (examples):
+    - aide ... eda.sample_max_rows=30000 eda.sample_rate=0.10 eda.max_columns=80
+
+Artifacts:
+- workspace_dir/artifacts/eda/{dataset_name}__{summary_hash}/
+  - summary.json
+  - compact.md and/or ultra.md (depending on mode)
+- Convenience symlinks:
+  - workspace_dir/EDA_SUMMARY.json
+  - workspace_dir/EDA_COMPACT.md (if compact enabled)
+
+Notes:
+- PII redaction and hashing are enforced by default (emails, phones, IPs, credit-card-like patterns). High-cardinality or long text values will be hashed.
+- The compact Markdown summary includes top features by salience, data quality issues, correlations/associations with leakage warnings, and a brief modeling plan hint.
+- Set eda.target_column if your target is known; otherwise, it will be inferred when possible.
