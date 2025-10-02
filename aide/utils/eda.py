@@ -248,9 +248,6 @@ def pack_compact_summary(summary: dict, eda_cfg, mode: str = "compact") -> str:
     # 5) Feature engineering checklist
     parts.append(_md_fe_checklist(cols, tinfo, meta.get("problem_type")))
 
-    # 6) Modeling hint
-    parts.append(_md_modeling_hint(meta.get("problem_type"), cols, rel))
-
     # Join and truncate by budget
     text = "\n".join([p for p in parts if p and p.strip()])
 
@@ -922,17 +919,6 @@ def _md_fe_checklist(cols: List[dict], tinfo: Optional[dict], problem_type: Opti
     if tinfo and tinfo.get("time_col"):
         lines.append("  - Time: derive lags, moving stats, calendar features.")
     lines.append("  - Handle missing values; consider 'Missing' category for cats with high missing.")
-    return "\n".join(lines)
-
-
-def _md_modeling_hint(problem_type: Optional[str], cols: List[dict], rel: dict) -> str:
-    lines = ["- Modeling hint:"]
-    if problem_type == "regression":
-        lines.append("  - Start with LightGBM/XGBoost; early stopping; 5-fold CV.")
-    elif problem_type == "classification":
-        lines.append("  - Start with LightGBM/XGBoost; early stopping; stratified 5-fold CV.")
-    else:
-        lines.append("  - Start with robust tree-based baseline; adopt CV strategy based on data size.")
     return "\n".join(lines)
 
 
