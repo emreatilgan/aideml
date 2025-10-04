@@ -57,3 +57,28 @@ agent:
     max_debug_depth: 3
     debug_prob: 0.5
     num_drafts: 5
+
+
+# EDA configuration
+eda:
+  enable: False
+  sample_max_rows: 30000
+  sample_rate: 0.10
+  sample_seed: 42
+  max_columns: 80
+  top_values_k: 10
+  top_tokens_k: 20
+  top_ngrams_k: 20
+  top_corr_k: 30
+  top_assoc_k: 30
+  redaction_enable: True
+  pii_hash_salt: AIDE_DEFAULT_SALT
+  pii_rules: [email, phone, ip, cc]
+  artifacts_subdir: artifacts/eda
+  cache_by_hash: True
+  target_column: null
+  compact:
+    enable: True
+    mode: compact   # {compact|ultra}
+    token_budget_compact: 900
+    token_budget_ultra: 450
