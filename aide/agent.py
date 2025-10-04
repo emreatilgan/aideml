@@ -48,7 +48,7 @@ review_func_spec = FunctionSpec(
             },
             "metric": {
                 "type": "number",
-                "description": "If the code ran successfully, report the value of the validation metric. Otherwise, leave it null.",
+                "description": "If the code ran successfully, report the value of the validation metric. For competitions evaluated by the mean of some metric (RMSE, RMSLE, Accuracy etc.) across multiple target columns, report the mean of some metric (RMSE, RMSLE, Accuracy etc.) averaged across all target columns (prefer a value clearly labeled 'mean_X' X being the column metric in the program output). Otherwise, leave it null.",
             },
             "lower_is_better": {
                 "type": "boolean",
@@ -159,6 +159,16 @@ class Agent:
             'You can also use the "./working" directory to store any temporary files that your code needs to create.',
             "REMEMBER THE ./submission/submission.csv FILE!!!!! The correct directory is important too.",
         ]
+        # Multi-target competitions using mean of some metric across targets
+        impl_guideline.append(
+            "If the competition's evaluation is the mean of the column metric across multiple target columns, compute metric per target column and average them to obtain a single mean of the metrics."
+        )
+        impl_guideline.append(
+            "Use this mean of the metrics for validation, model selection, early stopping, and hyperparameter tuning; also print it clearly as mean_X, X being the column metric, (e.g., 'mean_rmse: <value>')."
+        )
+        impl_guideline.append(
+            "When using k-fold CV, compute mean of the column metric within each fold, then average across folds to produce the final CV score that you print."
+        )
         if self.acfg.expose_prediction:
             impl_guideline.append(
                 "The implementation should include a predict() function, "
@@ -180,6 +190,7 @@ class Agent:
                 "Your response should be a brief outline/sketch of your proposed solution in natural language (3-5 sentences), "
                 "followed by a single markdown code block (wrapped in ```) which implements this solution and prints out the evaluation metric. "
                 "There should be no additional headings or text in your response. Just natural language text followed by a newline and then the markdown code block. "
+                "If the competition evaluates mean of the some metric across multiple target columns, the code must compute the mean X averaged across targets and print it clearly labeled as 'mean_X' (mean_RMSE as an example.). "
             )
         }
 
@@ -409,13 +420,17 @@ class Agent:
         introduction = (
             "You are a Kaggle grandmaster attending a competition. "
             "You have written code to solve this task and now need to evaluate the output of the code execution. "
-            "You should determine if there were any bugs as well as report the empirical findings."
+            "You should determine if there were any bugs as well as report the empirical findings. "
+            "If the competition uses mean of some metric across multiple target columns, base your evaluation on the mean of the metric averaged across the target columns. "
+            "If multiple metrics are printed, prefer a metric clearly labeled 'mean_X' or the single overall validation score that averages X across targets, X being the metric like RMSE."
         )
         if self.acfg.obfuscate:
             introduction = (
                 "You are an expert machine learning engineer attempting a task. "
                 "You have written code to solve this task and now need to evaluate the output of the code execution. "
-                "You should determine if there were any bugs as well as report the empirical findings."
+                "You should determine if there were any bugs as well as report the empirical findings. "
+                "If the task uses mean of the some metric across multiple target columns, base your evaluation on the mean of the some metric averaged across the target columns. "
+                "If multiple metrics are printed, prefer a metric clearly labeled 'mean_X' or the single overall validation score that averages X across targets, X being the metric like RMSE."
             )
         prompt = {
             "Introduction": introduction,
