@@ -9,6 +9,8 @@ from omegaconf import OmegaConf
 from rich.status import Status
 from .utils.config import load_task_desc, prep_agent_workspace, save_run, _load_cfg, prep_cfg
 from pathlib import Path
+# EDA integration for Python API usage as well
+from .utils import eda as eda_mod
 
 @dataclass
 class Solution:
@@ -36,6 +38,15 @@ class Experiment:
 
         with Status("Preparing agent workspace (copying and extracting files) ..."):
             prep_agent_workspace(self.cfg)
+
+        # Optional: run EDA and prepare artifacts/symlinks for prompt ingestion
+        if hasattr(self.cfg, "eda") and getattr(self.cfg.eda, "enable", False):
+            with Status("Running EDA ..."):
+                try:
+                    eda_mod.generate_and_cache(self.cfg)
+                except Exception:
+                    # Non-fatal for Experiment API
+                    pass
 
         self.journal = Journal()
         self.agent = Agent(

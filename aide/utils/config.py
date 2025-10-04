@@ -68,6 +68,38 @@ class ExecConfig:
     format_tb_ipython: bool
 
 
+# -------------------------
+# EDA configuration objects
+# -------------------------
+@dataclass
+class EDACompactConfig:
+    enable: bool
+    mode: str  # "compact" | "ultra"
+    token_budget_compact: int
+    token_budget_ultra: int
+
+
+@dataclass
+class EDAConfig:
+    enable: bool
+    sample_max_rows: int
+    sample_rate: float
+    sample_seed: int
+    max_columns: int
+    top_values_k: int
+    top_tokens_k: int
+    top_ngrams_k: int
+    top_corr_k: int
+    top_assoc_k: int
+    redaction_enable: bool
+    pii_hash_salt: str
+    pii_rules: list[str]
+    artifacts_subdir: str
+    cache_by_hash: bool
+    target_column: str | None
+    compact: EDACompactConfig
+
+
 @dataclass
 class Config(Hashable):
     data_dir: Path
@@ -87,6 +119,9 @@ class Config(Hashable):
 
     exec: ExecConfig
     agent: AgentConfig
+
+    # new EDA config root
+    eda: EDAConfig
 
 
 def _get_next_logindex(dir: Path) -> int:
@@ -143,9 +178,17 @@ def prep_cfg(cfg: Config):
     cfg.log_dir = (top_log_dir / cfg.exp_name).resolve()
     cfg.workspace_dir = (top_workspace_dir / cfg.exp_name).resolve()
 
-    # validate the config
+    # validate the config (bind to structured schema)
     cfg_schema: Config = OmegaConf.structured(Config)
     cfg = OmegaConf.merge(cfg_schema, cfg)
+
+    # ensure EDA artifacts directory exists (even if EDA disabled, harmless)
+    try:
+        artifacts_dir = (Path(cfg.workspace_dir) / cfg.eda.artifacts_subdir).resolve()  # type: ignore
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        # If EDA section is missing for any reason, skip silently
+        pass
 
     return cast(Config, cfg)
 

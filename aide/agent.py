@@ -343,6 +343,15 @@ class Agent:
     def update_data_preview(
         self,
     ):
+        # Prefer compact EDA Markdown if available
+        try:
+            eda_compact = self.cfg.workspace_dir / "EDA_COMPACT.md"
+            if eda_compact.exists():
+                self.data_preview = eda_compact.read_text()
+                return
+        except Exception:
+            pass
+        # Fallback to legacy directory preview
         self.data_preview = data_preview.generate(self.cfg.workspace_dir)
 
     def step(self, exec_callback: ExecCallbackType):
