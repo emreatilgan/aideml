@@ -3,6 +3,8 @@ import logging
 import random
 import time
 from typing import Any, Callable, cast
+from pathlib import Path
+import re
 
 import humanize
 from .backend import FunctionSpec, compile_prompt_to_md, query
@@ -82,6 +84,14 @@ class Agent:
         self.data_preview: str | None = None
         self.start_time = time.time()
         self.current_step = 0
+        # Select exactly one draft among the first N to be guided by the knowledge base
+        self.guided_draft_index = (
+            random.randint(0, self.acfg.search.num_drafts - 1)
+            if self.acfg.search.num_drafts > 0
+            else 0
+        )
+        # Root path to the bundled knowledge base code examples
+        self.kb_root = Path(__file__).parent / "knowledge_base" / "code_examples"
 
     def search_policy(self) -> Node | None:
         """Select a node to work on (or None to draft a new node)."""
@@ -194,6 +204,88 @@ class Agent:
             )
         }
 
+    # -------- Knowledge Base Guidance Utilities --------
+    def _task_text(self) -> str:
+        """Return the task description as plain text for keyword detection."""
+        desc = self.task_desc
+        try:
+            if isinstance(desc, dict):
+                return compile_prompt_to_md(desc)
+        except Exception:
+            pass
+        return str(desc)
+
+    def _detect_problem_type(self) -> str:
+        """Heuristically detect problem type to select a relevant KB example."""
+        text = (self._task_text() + "\n" + (self.data_preview or "")).lower()
+        cats = {
+            "vision": ["image", "images", "cv", "segmentation", "detection", "object", "yolo", "vit", "cnn", "mask", "super-resolution"],
+            "nlp": ["text", "nlp", "language", "bert", "gpt", "token", "sequence", "summarization", "translation", "ner", "sentiment", "qa", "question answering"],
+            "timeseries": ["time series", "timeseries", "forecast", "temporal", "lag", "rolling", "autocorrelation", "trend", "seasonal", "signal"],
+            "structured_data": ["tabular", "structured", "csv", "xgboost", "catboost", "random forest", "lightgbm", "feature", "columns", "row", "regression"],
+            "graph": ["graph", "gnn", "node", "edge", "network", "citation"],
+            "audio": ["audio", "speech", "asr", "mel", "spectrogram", "voice", "sound"],
+            "rl": ["reinforcement", "policy", "environment", "agent", "cartpole", "q-learning", "ppo", "ddpg"],
+            "generative": ["generate", "generation", "gan", "diffusion", "vae", "style", "dreambooth", "gpt2", "text generation"],
+        }
+        best_cat, best_score = "structured_data", -1
+        for cat, kws in cats.items():
+            score = sum(1 for kw in kws if kw in text)
+            if score > best_score:
+                best_cat, best_score = cat, score
+        logger.info(f"[kb] Detected problem type: {best_cat} (score={best_score})")
+        return best_cat
+
+    def _select_relevant_example(self, category: str) -> tuple[str, str]:
+        """
+        Pick the most relevant example file path and a code snippet from the KB.
+        Returns (relative_path_for_prompt, code_snippet). Empty strings if not found.
+        """
+        kb_dir = self.kb_root / category
+        if not kb_dir.exists():
+            return "", ""
+        files = sorted([p for p in kb_dir.glob("*.py") if p.is_file()])
+        if not files:
+            return "", ""
+
+        text = self._task_text().lower()
+        # Tokenize task text to keywords for fuzzy matching
+        tokens = set(re.findall(r"[a-zA-Z_]{3,}", text))
+
+        def score_file(p: Path) -> int:
+            name = p.stem.lower()
+            score = 0
+            # filename token matches
+            for t in tokens:
+                if t in name:
+                    score += 1
+            # small bonus for very common task patterns
+            for bonus_kw in ["classification", "regression", "segmentation", "detection", "translation", "summarization", "forecast", "recommend"]:
+                if bonus_kw in name:
+                    score += 2
+            return score
+
+        scored = sorted(((score_file(p), p) for p in files), key=lambda x: (-x[0], x[1].name))
+        best_score, best_path = scored[0]
+        if best_score == 0:
+            best_path = files[0]  # fallback deterministic choice
+
+        try:
+            snippet = best_path.read_text(encoding="utf-8", errors="ignore")
+            #snippet = trim_long_string(snippet, threshold=6000, k=3000)
+        except Exception as e:
+            logger.warning(f"[kb] Failed reading example {best_path}: {e}")
+            return "", ""
+
+        # Make path relative to repository root (parent of 'aide')
+        try:
+            repo_root = Path(__file__).parent.parent.resolve()
+            rel_path = str(best_path.resolve().relative_to(repo_root))
+        except Exception:
+            rel_path = str(best_path)
+
+        return rel_path, snippet
+
     def plan_and_code_query(self, prompt, retries=3) -> tuple[str, str]:
         """Generate a natural language plan + code in the same LLM call and split them apart."""
         completion_text = None
@@ -253,8 +345,38 @@ class Agent:
         if self.acfg.data_preview:
             prompt["Data Overview"] = self.data_preview
 
+        # Inject knowledge base example into exactly 1 of the first N drafts
+        guided_example_path: str | None = None
+        try:
+            draft_idx = len(self.journal.draft_nodes)
+            already_guided = any(
+                (n.parent is None) and (getattr(n, "guided_example_path", None) is not None)
+                for n in self.journal.nodes
+            )
+            should_guide = (
+                draft_idx < self.acfg.search.num_drafts
+                and not already_guided
+                and draft_idx == self.guided_draft_index
+            )
+            if should_guide:
+                category = self._detect_problem_type()
+                ex_path, ex_snippet = self._select_relevant_example(category)
+                if ex_path and ex_snippet:
+                    guided_example_path = ex_path
+                    prompt["Knowledge base guidance"] = [
+                        f"A relevant '{category}' example from our knowledge base is provided below. Use it as guidance and adapt it to this task.",
+                        "Borrow ideas, patterns, and structure as appropriate; do not copy irrelevant parts verbatim.",
+                        "Ensure the final code aligns with the current data schema and evaluation metric.",
+                    ]
+                    prompt["Knowledge base example"] = {
+                        "Snippet": wrap_code(ex_snippet),
+                    }
+                    logger.info(f"[draft] Injected KB example ({category}): {ex_path}")
+        except Exception as e:
+            logger.warning(f"[draft] Failed to inject knowledge base example: {e}")
+
         plan, code = self.plan_and_code_query(prompt)
-        new_node = Node(plan=plan, code=code)
+        new_node = Node(plan=plan, code=code, guided_example_path=guided_example_path)
         logger.info(f"Drafted new node {new_node.id}")
         return new_node
 

@@ -34,6 +34,8 @@ class Node(DataClassJsonMixin):
     parent: Optional["Node"] = field(default=None, kw_only=True)
     children: set["Node"] = field(default_factory=set, kw_only=True)
 
+    # ---- guidance metadata ----
+    guided_example_path: str | None = field(default=None, kw_only=True)
     # ---- execution info ----
     _term_out: list[str] = field(default=None, kw_only=True)  # type: ignore
     exec_time: float = field(default=None, kw_only=True)  # type: ignore
