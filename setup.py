@@ -16,6 +16,7 @@ setup(
     long_description_content_type="text/markdown",
     url="https://github.com/Wecoai/aideml",
     packages=find_packages(),
+    include_package_data=True,
     package_data={
         "aide": [
             "../requirements.txt",
@@ -24,6 +25,7 @@ setup(
             "example_tasks/bitcoin_price/*",
             "example_tasks/house_prices/*",
             "example_tasks/*",
+            "knowledge_base/code_examples/*/*.py",
         ]
     },
     classifiers=[

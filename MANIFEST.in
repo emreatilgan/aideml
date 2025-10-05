@@ -1,0 +1,7 @@
+recursive-include aide/knowledge_base/code_examples *.py
+recursive-include aide/example_tasks *
+recursive-include aide/utils/viz_templates *
+include aide/utils/config.yaml
+include requirements.txt
+include README.md
+include LICENSE
