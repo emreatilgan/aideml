@@ -13,7 +13,7 @@ from .journal import Journal, Node
 from .utils import data_preview
 from .utils.config import Config
 from .utils.metric import MetricValue, WorstMetricValue
-from .utils.response import extract_code, extract_text_up_to_code, wrap_code
+from .utils.response import extract_code, extract_text_up_to_code, wrap_code, trim_long_string
 
 logger = logging.getLogger("aide")
 
@@ -84,6 +84,8 @@ class Agent:
         self.data_preview: str | None = None
         self.start_time = time.time()
         self.current_step = 0
+        # Stage 1 plan (cached between drafts to keep Stage 2 prompts compact)
+        self.stage1_summary: str | None = None
         # Select exactly one draft among the first N to be guided by the knowledge base
         #self.guided_draft_index = (
         #    random.randint(0, self.acfg.search.num_drafts - 1)
@@ -273,7 +275,8 @@ class Agent:
 
         try:
             snippet = best_path.read_text(encoding="utf-8", errors="ignore")
-            #snippet = trim_long_string(snippet, threshold=6000, k=3000)
+            # keep knowledge-base example concise to reduce prompt length while preserving structure
+            snippet = trim_long_string(snippet, threshold=6000, k=3000)
         except Exception as e:
             logger.warning(f"[kb] Failed reading example {best_path}: {e}")
             return "", ""
@@ -286,6 +289,63 @@ class Agent:
             rel_path = str(best_path)
 
         return rel_path, snippet
+
+    # -------- Two-Stage Generation: Stage 1 (Plan) --------
+    def generate_stage1_summary(self) -> str:
+        """Generate and cache a concise, actionable plan that fits the dataset and competition context."""
+        if self.stage1_summary:
+            return self.stage1_summary
+
+        # compute an execution-time hint to bound complexity in Stage 1 planning
+        tot_time_elapsed = time.time() - self.start_time
+        tot_time_remaining = self.acfg.time_limit - tot_time_elapsed
+        exec_timeout = int(min(self.cfg.exec.timeout, tot_time_remaining))
+
+        introduction = (
+            "You are a Kaggle grandmaster. Produce a concise, actionable plan for a single-file solution "
+            "tailored to the dataset and evaluation. Do not include any code."
+        )
+        if self.acfg.obfuscate:
+            introduction = (
+                "You are an expert ML engineer. Produce a concise, actionable plan for a single-file solution "
+                "tailored to the dataset and evaluation. Do not include any code."
+            )
+
+        prompt: Any = {
+            "Introduction": introduction,
+            "Task description": self.task_desc,
+            "Instructions": {
+                "Output format": (
+                    "Return 5–8 bullet points (no code blocks). Each bullet must be specific and actionable."
+                ),
+                "Must include": [
+                    "Task framing (regression/classification/etc.) and target(s).",
+                    "Expected input schema assumptions relevant to the dataset.",
+                    "Primary model family you will use.",
+                    "Validation strategy (e.g., holdout, K-fold) and the key validation metric.",
+                    "Any essential preprocessing/feature engineering steps.",
+                    "How to generate predictions for the test set and save to ./submission/submission.csv.",
+                    f"Be mindful of runtime; the script should finish within {humanize.naturaldelta(exec_timeout)}.",
+                ],
+                "Prohibitions": [
+                    "Do not include any code.",
+                    "Keep it compact and practical, avoid long explanations.",
+                ],
+            },
+        }
+        if self.acfg.data_preview and self.data_preview:
+            prompt["Data Overview"] = self.data_preview
+
+        summary_text = query(
+            system_message=prompt,
+            user_message=None,
+            model=self.acfg.code.model,
+            temperature=max(0.1, self.acfg.code.temp * 0.7),
+            convert_system_to_user=self.acfg.convert_system_to_user,
+        )
+        self.stage1_summary = str(summary_text).strip()
+        logger.info("[stage1] Generated and cached plan summary")
+        return self.stage1_summary
 
     def plan_and_code_query(self, prompt, retries=3) -> tuple[str, str]:
         """Generate a natural language plan + code in the same LLM call and split them apart."""
@@ -311,43 +371,19 @@ class Agent:
         return "", completion_text  # type: ignore
 
     def _draft(self) -> Node:
-        introduction = (
-            "You are a Kaggle grandmaster attending a competition. "
-            "In order to win this competition, you need to come up with an excellent and creative plan "
-            "for a solution and then implement this solution in Python. We will now provide a description of the task."
-        )
-        if self.acfg.obfuscate:
-            introduction = (
-                "You are an expert machine learning engineer attempting a task. "
-                "In order to complete this task, you need to come up with an excellent and creative plan "
-                "for a solution and then implement this solution in Python. We will now provide a description of the task."
-            )
-        prompt: Any = {
-            "Introduction": introduction,
-            "Task description": self.task_desc,
-            "Memory": self.journal.generate_summary(),
-            "Instructions": {},
-        }
-        prompt["Instructions"] |= self._prompt_resp_fmt
-        prompt["Instructions"] |= {
-            "Solution sketch guideline": [
-                "This first solution design should be relatively simple, without ensembling or hyper-parameter optimization.",
-                "Take the Memory section into consideration when proposing the design,"
-                " don't propose the same modelling solution but keep the evaluation the same.",
-                "The solution sketch should be 3-5 sentences.",
-                "Propose an evaluation metric that is reasonable for this task.",
-                "Don't suggest to do EDA.",
-                "The data is already prepared and available in the `./input` directory. There is no need to unzip any files.",
-            ],
-        }
-        prompt["Instructions"] |= self._prompt_impl_guideline
-        prompt["Instructions"] |= self._prompt_environment
+        """
+        Two-stage drafting:
+          - Stage 1: Generate a compact, cached plan summary tailored to the dataset and task.
+          - Stage 2: Generate code using that plan. For baseline drafts, enforce a minimal baseline style.
+                     For exactly one knowledge-based draft, fully leverage the KB example to produce a more advanced solution.
+        """
+        # Ensure Stage 1 summary exists and is cached
+        stage1_plan = self.generate_stage1_summary()
 
-        if self.acfg.data_preview:
-            prompt["Data Overview"] = self.data_preview
-
-        # Inject knowledge base example into exactly 1 of the first N drafts
+        # Determine whether this draft should be the knowledge-based one
         guided_example_path: str | None = None
+        ex_snippet: str | None = None
+        category: str | None = None
         try:
             draft_idx = len(self.journal.draft_nodes)
             already_guided = any(
@@ -361,20 +397,74 @@ class Agent:
             )
             if should_guide:
                 category = self._detect_problem_type()
-                ex_path, ex_snippet = self._select_relevant_example(category)
-                if ex_path and ex_snippet:
+                ex_path, kb_snippet = self._select_relevant_example(category)
+                if ex_path and kb_snippet:
                     guided_example_path = ex_path
-                    prompt["Knowledge base guidance"] = [
-                        f"A relevant '{category}' example from our knowledge base is provided below. Use it as guidance and adapt it to this task.",
-                        "Borrow ideas, patterns, and structure as appropriate; do not copy irrelevant parts verbatim.",
-                        "Ensure the final code aligns with the current data schema and evaluation metric.",
-                    ]
-                    prompt["Knowledge base example"] = {
-                        "Snippet": wrap_code(ex_snippet),
-                    }
-                    logger.info(f"[draft] Injected KB example ({category}): {ex_path}")
+                    ex_snippet = kb_snippet
+                    logger.info(f"[draft] Knowledge-based draft selected (idx={draft_idx}) with KB example {ex_path}")
         except Exception as e:
-            logger.warning(f"[draft] Failed to inject knowledge base example: {e}")
+            logger.warning(f"[draft] KB selection failed: {e}")
+
+        # Build Stage 2 prompt
+        base_intro = (
+            "You are a Kaggle grandmaster attending a competition. "
+            "Based on the Stage 1 plan below, implement the solution in a single Python file."
+        )
+        kb_intro = (
+            "You are a Kaggle grandmaster attending a competition. "
+            "Based on the Stage 1 plan and the knowledge-base example below, implement a highly optimized, "
+            "context-aware solution that fully leverages the knowledge base."
+        )
+        if self.acfg.obfuscate:
+            base_intro = (
+                "You are an expert machine learning engineer. "
+                "Based on the Stage 1 plan below, implement the solution in a single Python file."
+            )
+            kb_intro = (
+                "You are an expert machine learning engineer. "
+                "Based on the Stage 1 plan and the knowledge-base example below, implement a highly optimized, "
+                "context-aware solution that fully leverages the knowledge base."
+            )
+
+        prompt: Any = {
+            "Introduction": kb_intro if ex_snippet else base_intro,
+            "Task description": self.task_desc,
+            "Stage 1 plan": stage1_plan,
+            "Instructions": {},
+        }
+
+        # Response format + critical implementation requirements
+        prompt["Instructions"] |= self._prompt_resp_fmt
+        prompt["Instructions"] |= self._prompt_impl_guideline
+
+        # Draft-style specific guidance
+        if ex_snippet:
+            prompt["Instructions"] |= {
+                "Knowledge-based drafting guideline": [
+                    "Leverage the structure, modeling choices, and patterns from the knowledge base example.",
+                    "Adapt to the present dataset and evaluation; do not copy irrelevant pieces.",
+                    "It is acceptable to use stronger models, advanced feature engineering, CV, early stopping, "
+                    "and reasonable optimization that fits within the runtime budget.",
+                ]
+            }
+            prompt["Knowledge base guidance"] = [
+                f"A relevant '{category}' example from our knowledge base is provided below.",
+                "Borrow ideas, patterns, and structure as appropriate; adapt to this dataset and metric.",
+            ]
+            prompt["Knowledge base example"] = {
+                "Snippet": wrap_code(ex_snippet),
+            }
+        else:
+            prompt["Instructions"] |= {
+                "Baseline drafting guideline": [
+                    "Produce a simple, minimal baseline-style implementation.",
+                    "Prefer straightforward models and defaults; avoid ensembling and heavy hyper-parameter tuning.",
+                    "Keep preprocessing light and pragmatic; prioritize reliability and clarity.",
+                ]
+            }
+
+        # Keep prompts compact in Stage 2 (omit Data Overview and Environment here);
+        # the Stage 1 plan already captures the essential context.
 
         plan, code = self.plan_and_code_query(prompt)
         new_node = Node(plan=plan, code=code, guided_example_path=guided_example_path)
@@ -395,9 +485,12 @@ class Agent:
                 "For this you should first outline a brief plan in natural language for how the solution can be improved and "
                 "then implement this improvement in Python based on the provided previous solution. "
             )
+        # Reference Stage 1 plan to keep improvement prompts compact and consistent
+        stage1_plan = self.generate_stage1_summary()
         prompt: Any = {
             "Introduction": introduction,
             "Task description": self.task_desc,
+            "Stage 1 plan": stage1_plan,
             "Memory": self.journal.generate_summary(),
             "Instructions": {},
         }
@@ -439,9 +532,12 @@ class Agent:
                 "Your response should be an implementation outline in natural language,"
                 " followed by a single markdown code block which implements the bugfix/solution."
             )
+        # Reference Stage 1 plan to keep debug prompts compact and anchored
+        stage1_plan = self.generate_stage1_summary()
         prompt: Any = {
             "Introduction": introduction,
             "Task description": self.task_desc,
+            "Stage 1 plan": stage1_plan,
             "Previous (buggy) implementation": wrap_code(parent_node.code),
             "Execution output": wrap_code(parent_node.term_out, lang=""),
             "Instructions": {},
