@@ -85,11 +85,12 @@ class Agent:
         self.start_time = time.time()
         self.current_step = 0
         # Select exactly one draft among the first N to be guided by the knowledge base
-        self.guided_draft_index = (
-            random.randint(0, self.acfg.search.num_drafts - 1)
-            if self.acfg.search.num_drafts > 0
-            else 0
-        )
+        #self.guided_draft_index = (
+        #    random.randint(0, self.acfg.search.num_drafts - 1)
+        #    if self.acfg.search.num_drafts > 0
+        #    else 0
+        #)
+        self.guided_draft_index = 0
         # Root path to the bundled knowledge base code examples
         self.kb_root = Path(__file__).parent / "knowledge_base" / "code_examples"
 
