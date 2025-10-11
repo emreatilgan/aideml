@@ -340,8 +340,8 @@ class Agent:
         summary_text = query(
             system_message=prompt,
             user_message=None,
-            model=self.acfg.code.model,
-            temperature=max(0.1, self.acfg.code.temp * 0.7),
+            model=self.acfg.feedback.model,
+            temperature=self.acfg.feedback.temp,
             convert_system_to_user=self.acfg.convert_system_to_user,
         )
         self.stage1_summary = str(summary_text).strip()
