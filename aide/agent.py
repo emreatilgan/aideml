@@ -86,12 +86,14 @@ class Agent:
         self.current_step = 0
         # Stage 1 plan (cached between drafts to keep Stage 2 prompts compact)
         self.stage1_summary: str | None = None
-        # Select exactly one draft among the first N to be guided by the knowledge base
-        self.guided_draft_index = (
-            random.randint(0, self.acfg.search.num_drafts - 1)
-            if self.acfg.search.num_drafts > 0
-            else 0
-        )
+        # Select up to K drafts among the first N to be guided by the knowledge base (configurable)
+        num_drafts = max(0, int(self.acfg.search.num_drafts))
+        guided_target = max(0, int(getattr(self.acfg.search, "guided_drafts", 1)))
+        k = min(num_drafts, guided_target)
+        self.guided_draft_indices: set[int] = set()
+        if k > 0 and num_drafts > 0:
+            self.guided_draft_indices = set(random.sample(range(num_drafts), k))
+        logger.info(f"[kb] Guided drafts configured: {sorted(self.guided_draft_indices)} out of first {num_drafts} drafts")
         # Root path to the bundled knowledge base code examples
         self.kb_root = Path(__file__).parent / "knowledge_base" / "code_examples"
 
@@ -385,14 +387,9 @@ class Agent:
         category: str | None = None
         try:
             draft_idx = len(self.journal.draft_nodes)
-            already_guided = any(
-                (n.parent is None) and (getattr(n, "guided_example_path", None) is not None)
-                for n in self.journal.nodes
-            )
             should_guide = (
                 draft_idx < self.acfg.search.num_drafts
-                and not already_guided
-                and draft_idx == self.guided_draft_index
+                and draft_idx in getattr(self, "guided_draft_indices", set())
             )
             if should_guide:
                 category = self._detect_problem_type()

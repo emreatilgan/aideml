@@ -57,6 +57,7 @@ agent:
     max_debug_depth: 3
     debug_prob: 0.5
     num_drafts: 5
+    guided_drafts: 1   # number of knowledge-guided drafts among the first N; set 0 to disable
 
 
 # EDA configuration

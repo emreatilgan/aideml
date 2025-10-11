@@ -43,6 +43,7 @@ class SearchConfig:
     max_debug_depth: int
     debug_prob: float
     num_drafts: int
+    guided_drafts: int = 1
 
 
 @dataclass
