@@ -3,6 +3,8 @@ import logging
 import random
 import time
 from typing import Any, Callable, cast
+from pathlib import Path
+import re
 
 import humanize
 from .backend import FunctionSpec, compile_prompt_to_md, query
@@ -11,7 +13,7 @@ from .journal import Journal, Node
 from .utils import data_preview
 from .utils.config import Config
 from .utils.metric import MetricValue, WorstMetricValue
-from .utils.response import extract_code, extract_text_up_to_code, wrap_code
+from .utils.response import extract_code, extract_text_up_to_code, wrap_code, trim_long_string
 
 logger = logging.getLogger("aide")
 
@@ -82,6 +84,18 @@ class Agent:
         self.data_preview: str | None = None
         self.start_time = time.time()
         self.current_step = 0
+        # Stage 1 plan (cached between drafts to keep Stage 2 prompts compact)
+        self.stage1_summary: str | None = None
+        # Select up to K drafts among the first N to be guided by the knowledge base (configurable)
+        num_drafts = max(0, int(self.acfg.search.num_drafts))
+        guided_target = max(0, int(getattr(self.acfg.search, "guided_drafts", 1)))
+        k = min(num_drafts, guided_target)
+        self.guided_draft_indices: set[int] = set()
+        if k > 0 and num_drafts > 0:
+            self.guided_draft_indices = set(random.sample(range(num_drafts), k))
+        logger.info(f"[kb] Guided drafts configured: {sorted(self.guided_draft_indices)} out of first {num_drafts} drafts")
+        # Root path to the bundled knowledge base code examples
+        self.kb_root = Path(__file__).parent / "knowledge_base" / "code_examples"
 
     def search_policy(self) -> Node | None:
         """Select a node to work on (or None to draft a new node)."""
@@ -194,6 +208,146 @@ class Agent:
             )
         }
 
+    # -------- Knowledge Base Guidance Utilities --------
+    def _task_text(self) -> str:
+        """Return the task description as plain text for keyword detection."""
+        desc = self.task_desc
+        try:
+            if isinstance(desc, dict):
+                return compile_prompt_to_md(desc)
+        except Exception:
+            pass
+        return str(desc)
+
+    def _detect_problem_type(self) -> str:
+        """Heuristically detect problem type to select a relevant KB example."""
+        text = (self._task_text() + "\n" + (self.data_preview or "")).lower()
+        cats = {
+            "vision": ["image", "images", "cv", "segmentation", "detection", "object", "yolo", "vit", "cnn", "mask", "super-resolution"],
+            "nlp": ["text", "nlp", "language", "bert", "gpt", "token", "sequence", "summarization", "translation", "ner", "sentiment", "qa", "question answering"],
+            "timeseries": ["time series", "timeseries", "forecast", "temporal", "lag", "rolling", "autocorrelation", "trend", "seasonal", "signal"],
+            "structured_data": ["tabular", "structured", "csv", "xgboost", "catboost", "random forest", "lightgbm", "feature", "columns", "row", "regression"],
+            "graph": ["graph", "gnn", "node", "edge", "network", "citation"],
+            "audio": ["audio", "speech", "asr", "mel", "spectrogram", "voice", "sound"],
+            "rl": ["reinforcement", "policy", "environment", "agent", "cartpole", "q-learning", "ppo", "ddpg"],
+            "generative": ["generate", "generation", "gan", "diffusion", "vae", "style", "dreambooth", "gpt2", "text generation"],
+        }
+        best_cat, best_score = "structured_data", -1
+        for cat, kws in cats.items():
+            score = sum(1 for kw in kws if kw in text)
+            if score > best_score:
+                best_cat, best_score = cat, score
+        logger.info(f"[kb] Detected problem type: {best_cat} (score={best_score})")
+        return best_cat
+
+    def _select_relevant_example(self, category: str) -> tuple[str, str]:
+        """
+        Pick the most relevant example file path and a code snippet from the KB.
+        Returns (relative_path_for_prompt, code_snippet). Empty strings if not found.
+        """
+        kb_dir = self.kb_root / category
+        if not kb_dir.exists():
+            return "", ""
+        files = sorted([p for p in kb_dir.glob("*.py") if p.is_file()])
+        if not files:
+            return "", ""
+
+        text = self._task_text().lower()
+        # Tokenize task text to keywords for fuzzy matching
+        tokens = set(re.findall(r"[a-zA-Z_]{3,}", text))
+
+        def score_file(p: Path) -> int:
+            name = p.stem.lower()
+            score = 0
+            # filename token matches
+            for t in tokens:
+                if t in name:
+                    score += 1
+            # small bonus for very common task patterns
+            for bonus_kw in ["classification", "regression", "segmentation", "detection", "translation", "summarization", "forecast", "recommend"]:
+                if bonus_kw in name:
+                    score += 2
+            return score
+
+        scored = sorted(((score_file(p), p) for p in files), key=lambda x: (-x[0], x[1].name))
+        best_score, best_path = scored[0]
+        if best_score == 0:
+            best_path = files[0]  # fallback deterministic choice
+
+        try:
+            snippet = best_path.read_text(encoding="utf-8", errors="ignore")
+            # keep knowledge-base example concise to reduce prompt length while preserving structure
+            snippet = trim_long_string(snippet, threshold=6000, k=3000)
+        except Exception as e:
+            logger.warning(f"[kb] Failed reading example {best_path}: {e}")
+            return "", ""
+
+        # Make path relative to repository root (parent of 'aide')
+        try:
+            repo_root = Path(__file__).parent.parent.resolve()
+            rel_path = str(best_path.resolve().relative_to(repo_root))
+        except Exception:
+            rel_path = str(best_path)
+
+        return rel_path, snippet
+
+    # -------- Two-Stage Generation: Stage 1 (Plan) --------
+    def generate_stage1_summary(self) -> str:
+        """Generate and cache a concise, actionable plan that fits the dataset and competition context."""
+        if self.stage1_summary:
+            return self.stage1_summary
+
+        # compute an execution-time hint to bound complexity in Stage 1 planning
+        tot_time_elapsed = time.time() - self.start_time
+        tot_time_remaining = self.acfg.time_limit - tot_time_elapsed
+        exec_timeout = int(min(self.cfg.exec.timeout, tot_time_remaining))
+
+        introduction = (
+            "You are a Kaggle grandmaster. Produce a concise, actionable plan for a single-file solution "
+            "tailored to the dataset and evaluation. Do not include any code."
+        )
+        if self.acfg.obfuscate:
+            introduction = (
+                "You are an expert ML engineer. Produce a concise, actionable plan for a single-file solution "
+                "tailored to the dataset and evaluation. Do not include any code."
+            )
+
+        prompt: Any = {
+            "Introduction": introduction,
+            "Task description": self.task_desc,
+            "Instructions": {
+                "Output format": (
+                    "Return 5–8 bullet points (no code blocks). Each bullet must be specific and actionable."
+                ),
+                "Must include": [
+                    "Task framing (regression/classification/etc.) and target(s).",
+                    "Expected input schema assumptions relevant to the dataset.",
+                    "Primary model family you will use.",
+                    "Validation strategy (e.g., holdout, K-fold) and the key validation metric.",
+                    "Any essential preprocessing/feature engineering steps.",
+                    "How to generate predictions for the test set and save to ./submission/submission.csv.",
+                    f"Be mindful of runtime; the script should finish within {humanize.naturaldelta(exec_timeout)}.",
+                ],
+                "Prohibitions": [
+                    "Do not include any code.",
+                    "Keep it compact and practical, avoid long explanations.",
+                ],
+            },
+        }
+        if self.acfg.data_preview and self.data_preview:
+            prompt["Data Overview"] = self.data_preview
+
+        summary_text = query(
+            system_message=prompt,
+            user_message=None,
+            model=self.acfg.code.model,
+            temperature=max(0.1, self.acfg.code.temp * 0.7),
+            convert_system_to_user=self.acfg.convert_system_to_user,
+        )
+        self.stage1_summary = str(summary_text).strip()
+        logger.info("[stage1] Generated and cached plan summary")
+        return self.stage1_summary
+
     def plan_and_code_query(self, prompt, retries=3) -> tuple[str, str]:
         """Generate a natural language plan + code in the same LLM call and split them apart."""
         completion_text = None
@@ -218,43 +372,98 @@ class Agent:
         return "", completion_text  # type: ignore
 
     def _draft(self) -> Node:
-        introduction = (
+        """
+        Two-stage drafting:
+          - Stage 1: Generate a compact, cached plan summary tailored to the dataset and task.
+          - Stage 2: Generate code using that plan. For baseline drafts, enforce a minimal baseline style.
+                     For exactly one knowledge-based draft, fully leverage the KB example to produce a more advanced solution.
+        """
+        # Ensure Stage 1 summary exists and is cached
+        stage1_plan = self.generate_stage1_summary()
+
+        # Determine whether this draft should be the knowledge-based one
+        guided_example_path: str | None = None
+        ex_snippet: str | None = None
+        category: str | None = None
+        try:
+            draft_idx = len(self.journal.draft_nodes)
+            should_guide = (
+                draft_idx < self.acfg.search.num_drafts
+                and draft_idx in getattr(self, "guided_draft_indices", set())
+            )
+            if should_guide:
+                category = self._detect_problem_type()
+                ex_path, kb_snippet = self._select_relevant_example(category)
+                if ex_path and kb_snippet:
+                    guided_example_path = ex_path
+                    ex_snippet = kb_snippet
+                    logger.info(f"[draft] Knowledge-based draft selected (idx={draft_idx}) with KB example {ex_path}")
+        except Exception as e:
+            logger.warning(f"[draft] KB selection failed: {e}")
+
+        # Build Stage 2 prompt
+        base_intro = (
             "You are a Kaggle grandmaster attending a competition. "
-            "In order to win this competition, you need to come up with an excellent and creative plan "
-            "for a solution and then implement this solution in Python. We will now provide a description of the task."
+            "Based on the Stage 1 plan below, implement the solution in a single Python file."
+        )
+        kb_intro = (
+            "You are a Kaggle grandmaster attending a competition. "
+            "Based on the Stage 1 plan and the knowledge-base example below, implement a highly optimized, "
+            "context-aware solution that fully leverages the knowledge base."
         )
         if self.acfg.obfuscate:
-            introduction = (
-                "You are an expert machine learning engineer attempting a task. "
-                "In order to complete this task, you need to come up with an excellent and creative plan "
-                "for a solution and then implement this solution in Python. We will now provide a description of the task."
+            base_intro = (
+                "You are an expert machine learning engineer. "
+                "Based on the Stage 1 plan below, implement the solution in a single Python file."
             )
+            kb_intro = (
+                "You are an expert machine learning engineer. "
+                "Based on the Stage 1 plan and the knowledge-base example below, implement a highly optimized, "
+                "context-aware solution that fully leverages the knowledge base."
+            )
+
         prompt: Any = {
-            "Introduction": introduction,
+            "Introduction": kb_intro if ex_snippet else base_intro,
             "Task description": self.task_desc,
-            "Memory": self.journal.generate_summary(),
+            "Stage 1 plan": stage1_plan,
             "Instructions": {},
         }
-        prompt["Instructions"] |= self._prompt_resp_fmt
-        prompt["Instructions"] |= {
-            "Solution sketch guideline": [
-                "This first solution design should be relatively simple, without ensembling or hyper-parameter optimization.",
-                "Take the Memory section into consideration when proposing the design,"
-                " don't propose the same modelling solution but keep the evaluation the same.",
-                "The solution sketch should be 3-5 sentences.",
-                "Propose an evaluation metric that is reasonable for this task.",
-                "Don't suggest to do EDA.",
-                "The data is already prepared and available in the `./input` directory. There is no need to unzip any files.",
-            ],
-        }
-        prompt["Instructions"] |= self._prompt_impl_guideline
-        prompt["Instructions"] |= self._prompt_environment
 
-        if self.acfg.data_preview:
-            prompt["Data Overview"] = self.data_preview
+        # Response format + critical implementation requirements
+        prompt["Instructions"] |= self._prompt_resp_fmt
+        prompt["Instructions"] |= self._prompt_impl_guideline
+
+        # Draft-style specific guidance
+        if ex_snippet:
+            prompt["Instructions"] |= {
+                "Knowledge-based drafting guideline": [
+                    "Leverage the structure, modeling choices, and patterns from the knowledge base example.",
+                    "Adapt to the present dataset and evaluation; do not copy irrelevant pieces.",
+                    "It is acceptable to use stronger models, advanced feature engineering, CV, early stopping, "
+                    "and reasonable optimization that fits within the runtime budget.",
+                ]
+            }
+            prompt["Knowledge base guidance"] = [
+                f"A relevant '{category}' example from our knowledge base is provided below.",
+                "Borrow ideas, patterns, and structure as appropriate; adapt to this dataset and metric.",
+            ]
+            prompt["Knowledge base example"] = {
+                "Snippet": wrap_code(ex_snippet),
+            }
+        else:
+            prompt["Instructions"] |= {
+                "Baseline drafting guideline": [
+                    "Produce a simple, minimal baseline-style implementation.",
+                    "Prefer straightforward models and defaults; avoid ensembling and heavy hyper-parameter tuning.",
+                    "Keep preprocessing light and pragmatic; prioritize reliability and clarity.",
+                ]
+            }
+
+        # Keep prompts compact in Stage 2 (omit Data Overview and Environment here);
+        # the Stage 1 plan already captures the essential context.
 
         plan, code = self.plan_and_code_query(prompt)
-        new_node = Node(plan=plan, code=code)
+        new_node = Node(plan=plan, code=code, guided_example_path=guided_example_path)
         logger.info(f"Drafted new node {new_node.id}")
         return new_node
 
@@ -272,9 +481,12 @@ class Agent:
                 "For this you should first outline a brief plan in natural language for how the solution can be improved and "
                 "then implement this improvement in Python based on the provided previous solution. "
             )
+        # Reference Stage 1 plan to keep improvement prompts compact and consistent
+        stage1_plan = self.generate_stage1_summary()
         prompt: Any = {
             "Introduction": introduction,
             "Task description": self.task_desc,
+            "Stage 1 plan": stage1_plan,
             "Memory": self.journal.generate_summary(),
             "Instructions": {},
         }
@@ -316,9 +528,12 @@ class Agent:
                 "Your response should be an implementation outline in natural language,"
                 " followed by a single markdown code block which implements the bugfix/solution."
             )
+        # Reference Stage 1 plan to keep debug prompts compact and anchored
+        stage1_plan = self.generate_stage1_summary()
         prompt: Any = {
             "Introduction": introduction,
             "Task description": self.task_desc,
+            "Stage 1 plan": stage1_plan,
             "Previous (buggy) implementation": wrap_code(parent_node.code),
             "Execution output": wrap_code(parent_node.term_out, lang=""),
             "Instructions": {},

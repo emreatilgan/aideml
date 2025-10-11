@@ -212,3 +212,45 @@ Notes:
 - PII redaction and hashing are enforced by default (emails, phones, IPs, credit-card-like patterns). High-cardinality or long text values will be hashed.
 - The compact Markdown summary includes top features by salience, data quality issues, correlations/associations with leakage warnings, and a brief modeling plan hint.
 - Set eda.target_column if your target is known; otherwise, it will be inferred when possible.
+
+## Two-stage generation and knowledge-based draft
+
+AIDE now generates initial solutions using a two-stage flow that improves diversity and depth across drafts while keeping prompts compact:
+
+- Stage 1 – Plan summary
+  - AIDE first produces a concise, actionable plan tailored to the dataset/task and evaluation metric.
+  - This plan is generated once and cached for the run to keep subsequent prompts small.
+  - Implementation: see [Agent.generate_stage1_summary()](aide/agent.py:294).
+- Stage 2 – Code generation
+  - Using the cached Stage 1 plan, AIDE creates multiple drafts.
+  - Baseline drafts are minimal, straightforward implementations with light preprocessing and no heavy tuning.
+  - Exactly one draft among the first N (N = `agent.search.num_drafts`) is a knowledge-based draft that leverages the internal code examples knowledge base to produce a stronger, optimized solution.
+  - Implementation: see [Agent._draft()](aide/agent.py:373).
+
+Knowledge-based draft behavior
+
+- Problem-type detection and example selection:
+  - AIDE infers a coarse problem category (e.g., tabular, NLP, vision, time series) from the task and data preview.
+  - It then selects a relevant code example from the bundled knowledge base for guidance.
+  - Implementation: [Agent._detect_problem_type()](aide/agent.py:221), [Agent._select_relevant_example()](aide/agent.py:242).
+- Prompt efficiency:
+  - The selected example is trimmed to preserve structure while minimizing tokens via [trim_long_string()](aide/utils/response.py:41).
+  - The Stage 2 prompt stays compact by referencing the cached Stage 1 plan instead of re-injecting the entire environment/data preview on every draft.
+- Draft styles:
+  - Baseline drafts use simple models and defaults, avoiding ensembling and heavy hyper-parameter tuning.
+  - The knowledge-based draft is allowed to leverage stronger modeling, advanced feature engineering, early stopping, and appropriate cross-validation, within the runtime budget.
+
+Where Stage 1 is used
+
+- Drafting: [Agent._draft()](aide/agent.py:373)
+- Improvements: [Agent._improve()](aide/agent.py:474)
+- Debugging: [Agent._debug()](aide/agent.py:516)
+- In each case, Stage 1 serves as an anchor that keeps prompts concise and consistent across iterations.
+
+Configuration notes
+
+- The number of initial drafts is controlled by `agent.search.num_drafts` in [`config.yaml`](aide/utils/config.yaml).
+- The knowledge-based draft is selected deterministically among the first N drafts (index 0 by default); this can be randomized in code if desired.
+- Existing guarantees remain unchanged: every generated solution must print a validation metric and save predictions to `./submission/submission.csv` as enforced in [Agent._prompt_impl_guideline](aide/agent.py:156) and evaluated in [Agent.parse_exec_result()](aide/agent.py:628).
+
+This two-stage approach reduces prompt length, encourages draft diversity, and makes the knowledge-based draft clearly stand out as the most informed and refined version while retaining strict submission and evaluation behaviors.
